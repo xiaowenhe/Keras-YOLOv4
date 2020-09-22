@@ -75,6 +75,10 @@ def draw(image, boxes, scores, classes, all_classes, colors):
 
 
 if __name__ == '__main__':
+    video_path = 'D://PycharmProjects/moviepy/che.mp4'
+    output_dir = './video_out'
+
+
     # classes_path = 'data/voc_classes.txt'
     classes_path = 'data/coco_classes.txt'
     # model_path可以是'yolov4.h5'、'./weights/step00001000.h5'这些。
@@ -82,8 +86,8 @@ if __name__ == '__main__':
     # model_path = './weights/step00070000.h5'
 
     # input_shape越大，精度会上升，但速度会下降。
-    # input_shape = (320, 320)
-    input_shape = (416, 416)
+    input_shape = (320, 320)
+    # input_shape = (416, 416)
     # input_shape = (608, 608)
 
     # 验证时的分数阈值和nms_iou阈值
@@ -124,33 +128,28 @@ if __name__ == '__main__':
     random.seed(None)
 
 
-    path_dir = os.listdir('images/test')
-    # warm up
-    if use_gpu:
-        for k, filename in enumerate(path_dir):
-            image = cv2.imread('images/test/' + filename)
-
-            # 预处理方式一
-            pimage = process_image(np.copy(image), input_shape)
-            # 预处理方式二
-            # pimage = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            # pimage = np.expand_dims(pimage, axis=0)
-
-            outs = yolo.predict(pimage)
-            if k == 10:
-                break
-
-
-    time_stat = deque(maxlen=20)
-    start_time = time.time()
-    end_time = time.time()
-    num_imgs = len(path_dir)
+    capture = cv2.VideoCapture(video_path)
+    fps = 30
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_name = os.path.split(video_path)[-1]
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    out_path = os.path.join(output_dir, video_name)
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+    index = 1
     start = time.time()
-    for k, filename in enumerate(path_dir):
-        image = cv2.imread('images/test/' + filename)
+    while (1):
+        ret, frame = capture.read()
+        if not ret:
+            break
+        print('detect frame:%d' % (index))
+        index += 1
+
 
         # 预处理方式一
-        pimage = process_image(np.copy(image), input_shape)
+        pimage = process_image(np.copy(frame), input_shape)
         # 预处理方式二
         # pimage = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         # pimage = np.expand_dims(pimage, axis=0)
@@ -158,26 +157,16 @@ if __name__ == '__main__':
         outs = yolo.predict(pimage)
         boxes, scores, classes = outs[0][0], outs[1][0], outs[2][0]
 
-        img_h, img_w, _ = image.shape
+        img_h, img_w, _ = frame.shape
         a = input_shape[0]
         boxes = boxes * [img_w/a, img_h/a, img_w/a, img_h/a]
         if boxes is not None and draw_image:
-            draw(image, boxes, scores, classes, all_classes, colors)
+            draw(frame, boxes, scores, classes, all_classes, colors)
 
-        # 估计剩余时间
-        start_time = end_time
-        end_time = time.time()
-        time_stat.append(end_time - start_time)
-        time_cost = np.mean(time_stat)
-        eta_sec = (num_imgs - k) * time_cost
-        eta = str(datetime.timedelta(seconds=int(eta_sec)))
-
-        logger.info('Infer iter {}, num_imgs={}, eta={}.'.format(k, num_imgs, eta))
-        if draw_image:
-            cv2.imwrite('images/res/' + filename, image)
-            logger.info("Detection bbox results save in images/res/{}".format(filename))
-    cost = time.time() - start
-    logger.info('total time: {0:.6f}s'.format(cost))
-    logger.info('Speed: %.6fs per image,  %.1f FPS.'%((cost / num_imgs), (num_imgs / cost)))
+        cv2.imshow("detection", frame)
+        writer.write(frame)
+        if cv2.waitKey(110) & 0xff == 27:
+            break
+    writer.release()
 
 

@@ -24,15 +24,17 @@ PaddlePaddle完美复刻版版yolact: https://github.com/miemie2013/PaddlePaddle
 
 yolov3魔改成yolact: https://github.com/miemie2013/yolact
 
-Keras版YOLOv4: https://github.com/miemie2013/Keras-YOLOv4
+Keras版YOLOv4: https://github.com/miemie2013/Keras-YOLOv4 (mAP 41%+)
 
-Pytorch版YOLOv4: 制作中
+Pytorch版YOLOv4: https://github.com/miemie2013/Pytorch-YOLOv4 (mAP 41%+)
 
-Paddle版YOLOv4：https://github.com/miemie2013/Paddle-YOLOv4
+Paddle版YOLOv4：https://github.com/miemie2013/Paddle-YOLOv4 (mAP 41%+)
 
 Keras版SOLO: https://github.com/miemie2013/Keras-SOLO
 
 Paddle版SOLO: https://github.com/miemie2013/Paddle-SOLO
+
+Pytorch版FCOS: https://github.com/miemie2013/Pytorch-FCOS
 
 ## 更新日记
 
@@ -47,8 +49,7 @@ Paddle版SOLO: https://github.com/miemie2013/Paddle-SOLO
 2020/06/10:更新Paddle镜像版YOLOv4：https://github.com/miemie2013/Paddle-YOLOv4
 ，从此GPU不求人，快去AIStudio训练自己的YOLOv4、验证想法吧！
 
-2020/06/18:经过验证，Paddle镜像版YOLOv4：https://github.com/miemie2013/Paddle-YOLOv4
-，可以刷到43.4mAP（不冻结任何层的情况下），赶紧star我的Paddle版YOLOv4，去AIStudio抢显卡训练吧！
+2020/08/19:经过仔细核对yolov4原始配置文件，发现网络部分写错了，现已修正。运行1_pytorch2keras.py后再运行eval.py，获得mAP=0.479。（该mAP是COCO val2017的精度）
 
 ## 需要补充
 
@@ -58,66 +59,6 @@ Paddle版SOLO: https://github.com/miemie2013/Paddle-SOLO
 
 需要安装cuda9，其余见requirements.txt。预计可能会升级到tf2、cuda10。
 
-## 文件下载
-一个没有训练充分的模型step00070000.h5，用6G的卡训练，冻结了conv2d_86之前的层，训练了70000步，
-
-链接：https://pan.baidu.com/s/17R9pmdsxLo2cx-0M-EVfyg 
-提取码：ib2u
-
-下载好之后，运行eval.py得到该模型的mAP（input_shape = (608, 608)，分数阈值=0.001，nms阈值=0.45的情况下）：
-```
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.373
-Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.605
-Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.394
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.212
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.406
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.508
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.296
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.475
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.509
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.334
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.548
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.639
-```
-追求更高的精度，你需要把冻结层的代码删除，也就是train.py中ly.trainable = False那一部分。但是需要你有一块高显存的显卡。
-
-## 我是如何做到43.4mAP（val2017）的
-我用了Paddle版YOLOv4：https://github.com/miemie2013/Paddle-YOLOv4
-来进行训练，这个仓库也是我写的，是这个Keras版本的等价版本，代码有很多相似处。
-当你在AIStudio抢到32GB显卡时，可以开batch_size=8；当你在AIStudio抢到16GB显卡时，可以开batch_size=4。
-我在开batch_size=8，不冻结任何层的情况下，训练了245000步之后（中间有把学习率降低到0.00001），
-得到如下结果（input_shape = (608, 608)，分数阈值=0.001，nms阈值=0.45的情况下）：
-```
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.434
-Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.661
-Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.472
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.279
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.486
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.539
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.330
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.529
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.561
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.403
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.609
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.665
-```
-该模型在test集的结果（input_shape = (608, 608)，分数阈值=0.001，nms阈值=0.45的情况下）：
-```
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.410
-Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.625
-Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.447
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.236
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.445
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.509
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.322
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.510
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.538
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.359
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.577
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.651
-```
-还等什么，赶紧star我的Paddle版YOLOv4，去AIStudio抢显卡训练吧！
-
 ## 训练
 下载我从Tianxiaomo的仓库保存下来的pytorch模型yolov4.pt
 链接：https://pan.baidu.com/s/152poRrQW9Na_C8rkhNEh3g
@@ -126,7 +67,6 @@ Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.651
 将它放在项目根目录下。然后运行1_pytorch2keras.py得到一个yolov4.h5，它也位于根目录下。
 运行train.py进行训练。通过修改config.py代码来进行更换数据集、更改超参数以及训练参数。
 
-或者你不下载yolov4.pt，而是下载上面提到的训练不充分的step00070000.h5继续训练也可以。
 追求更高的精度，你需要把冻结层的代码删除，也就是train.py中ly.trainable = False那一部分。但是需要你有一块高显存的显卡。
 训练时默认每5000步计算一次验证集的mAP。
 
@@ -155,26 +95,29 @@ xxx.jpg 48,240,195,371,11 8,12,352,498,14
 https://competitions.codalab.org/competitions/20794#participate
 获得bbox mAP.
 
-上述step00070000.h5在test集的mAP是（input_shape = (608, 608)，分数阈值=0.001，nms阈值=0.45的情况下）
+上述yolov4.h5在test集的mAP是（input_shape = (608, 608)，分数阈值=0.001，nms阈值=0.45的情况下）
 ```
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.340
-Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.554
-Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.362
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.171
-Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.360
-Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.445
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.280
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.445
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.473
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.284
-Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.503
-Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.591
+Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.411
+Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = 0.639
+Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = 0.444
+Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.235
+Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.448
+Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.515
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = 0.322
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = 0.506
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = 0.533
+Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.340
+Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.578
+Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.668
 ```
 
 该mAP是test集的结果，也就是大部分检测算法论文的标准指标。有点谜，根据我之前的经验test集的mAP和val集的mAP应该是差不多的。原因已经找到，由于原版YOLO v4使用coco trainval2014进行训练，训练样本中包含部分评估样本，若使用val集会导致精度虚高。
 
 ## 预测
 运行demo.py。运行demo_fast.py。
+
+## 预测视频
+运行demo_video.py。（按esc键停止播放）
 
 ## 传送门
 cv算法交流q群：645796480
