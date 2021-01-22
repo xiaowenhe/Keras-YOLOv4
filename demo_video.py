@@ -3,133 +3,85 @@
 # ================================================================
 #
 #   Author      : miemie2013
-#   Created date: 2020-06-03 15:35:27
-#   Description : keras_yolov4
+#   Created date: 2020-10-30 21:08:11
+#   Description : keras_ppyolo
 #
 # ================================================================
 from collections import deque
 import datetime
 import cv2
 import os
-import colorsys
-import random
 import time
-import numpy as np
-import tensorflow as tf
-import keras.layers as layers
-from tools.cocotools import get_classes
-from model.yolov4 import YOLOv4
+import threading
+import argparse
+
+from config import *
 from model.decode_np import Decode
+from model.yolo import *
+from tools.cocotools import get_classes
 
 import logging
 FORMAT = '%(asctime)s-%(levelname)s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 logger = logging.getLogger(__name__)
 
-
-
-# 6G的卡，训练时如果要预测，则设置use_gpu = False，否则显存不足。
-use_gpu = False
-use_gpu = True
-
-# 显存分配。
-if use_gpu:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-else:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-from keras.backend.tensorflow_backend import set_session
-config = tf.ConfigProto()
-config.gpu_options.per_process_gpu_memory_fraction = 1.0
-set_session(tf.Session(config=config))
-
-
-def process_image(img, input_shape):
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w = img.shape[:2]
-    scale_x = float(input_shape[1]) / w
-    scale_y = float(input_shape[0]) / h
-    img = cv2.resize(img, None, None, fx=scale_x, fy=scale_y, interpolation=cv2.INTER_CUBIC)
-    pimage = img.astype(np.float32) / 255.
-    pimage = np.expand_dims(pimage, axis=0)
-    return pimage
-
-
-def draw(image, boxes, scores, classes, all_classes, colors):
-    image_h, image_w, _ = image.shape
-    for box, score, cl in zip(boxes, scores, classes):
-        x0, y0, x1, y1 = box
-        left = max(0, np.floor(x0 + 0.5).astype(int))
-        top = max(0, np.floor(y0 + 0.5).astype(int))
-        right = min(image.shape[1], np.floor(x1 + 0.5).astype(int))
-        bottom = min(image.shape[0], np.floor(y1 + 0.5).astype(int))
-        bbox_color = colors[cl]
-        # bbox_thick = 1 if min(image_h, image_w) < 400 else 2
-        bbox_thick = 1
-        cv2.rectangle(image, (left, top), (right, bottom), bbox_color, bbox_thick)
-        bbox_mess = '%s: %.2f' % (all_classes[cl], score)
-        t_size = cv2.getTextSize(bbox_mess, 0, 0.5, thickness=1)[0]
-        cv2.rectangle(image, (left, top), (left + t_size[0], top - t_size[1] - 3), bbox_color, -1)
-        cv2.putText(image, bbox_mess, (left, top - 2), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
-
+parser = argparse.ArgumentParser(description='YOLO Infer Script')
+parser.add_argument('--use_gpu', type=bool, default=True)
+parser.add_argument('--config', type=int, default=1,
+                    choices=[0, 1, 2],
+                    help='0 -- yolov4_2x.py;  1 -- ppyolo_2x.py;  2 -- ppyolo_r18vd.py;  ')
+args = parser.parse_args()
+config_file = args.config
+use_gpu = args.use_gpu
 
 
 if __name__ == '__main__':
-    video_path = 'D://PycharmProjects/moviepy/che.mp4'
-    output_dir = './video_out'
+    video_path = 'D://PycharmProjects/moviepy/che3.mp4'
+    output_dir = './video_out'   # 生成的视频存放路径
+    fps = 60   # 生成的视频的帧率。应该和原视频一样。
+
+    cfg = None
+    if config_file == 0:
+        cfg = YOLOv4_2x_Config()
+    elif config_file == 1:
+        cfg = PPYOLO_2x_Config()
+    elif config_file == 2:
+        cfg = PPYOLO_r18vd_Config()
 
 
-    # classes_path = 'data/voc_classes.txt'
-    classes_path = 'data/coco_classes.txt'
-    # model_path可以是'yolov4.h5'、'./weights/step00001000.h5'这些。
-    model_path = 'yolov4.h5'
-    # model_path = './weights/step00070000.h5'
+    # 读取的模型
+    model_path = cfg.test_cfg['model_path']
 
-    # input_shape越大，精度会上升，但速度会下降。
-    input_shape = (320, 320)
-    # input_shape = (416, 416)
-    # input_shape = (608, 608)
+    # 是否给图片画框。
+    draw_image = cfg.test_cfg['draw_image']
+    draw_thresh = cfg.test_cfg['draw_thresh']
 
-    # 验证时的分数阈值和nms_iou阈值
-    conf_thresh = 0.05
-    nms_thresh = 0.45
-    keep_top_k = 100
-    nms_top_k = 100
-
-    # 是否给图片画框。不画可以提速。读图片、后处理还可以继续优化。
-    draw_image = True
-    # draw_image = False
-
-    # 初始卷积核个数
-    initial_filters = 32
-    anchors = np.array([
-        [[12, 16], [19, 36], [40, 28]],
-        [[36, 75], [76, 55], [72, 146]],
-        [[142, 110], [192, 243], [459, 401]]
-    ])
-    # 一些预处理
-    anchors = anchors.astype(np.float32)
-    num_anchors = len(anchors[0])  # 每个输出层有几个先验框
-
-    all_classes = get_classes(classes_path)
+    all_classes = get_classes(cfg.classes_path)
     num_classes = len(all_classes)
-    inputs = layers.Input(shape=(None, None, 3))
-    yolo = YOLOv4(inputs, num_classes, num_anchors, initial_filters, True, anchors, conf_thresh, nms_thresh, keep_top_k, nms_top_k)
-    yolo.load_weights(model_path, by_name=True)
+
+
+    # 创建模型
+    Backbone = select_backbone(cfg.backbone_type)
+    backbone = Backbone(**cfg.backbone)
+    Head = select_head(cfg.head_type)
+    cfg.head['drop_block'] = False   # 预测时关闭DropBlock，以获得一致的推理结果。
+    head = Head(yolo_loss=None, nms_cfg=cfg.nms_cfg, **cfg.head)
+    yolo = YOLO(backbone, head)
+
+    x = keras.layers.Input(shape=(None, None, 3), name='x', dtype='float32')
+    im_size = keras.layers.Input(shape=(2,), name='im_size', dtype='int32')
+    outputs = yolo.get_outputs(x)
+    preds = yolo.get_prediction(outputs, im_size)
+    predict_model = keras.models.Model(inputs=[x, im_size], outputs=preds)
+    predict_model.load_weights(model_path, by_name=True, skip_mismatch=True)
+    predict_model.summary(line_length=130)
+
+    _decode = Decode(predict_model, all_classes, use_gpu, cfg, for_test=True)
 
     if not os.path.exists('images/res/'): os.mkdir('images/res/')
-
-    # 定义颜色
-    hsv_tuples = [(1.0 * x / num_classes, 1., 1.) for x in range(num_classes)]
-    colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
-    colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), colors))
-    random.seed(0)
-    random.shuffle(colors)
-    random.seed(None)
-
+    path_dir = os.listdir('images/test')
 
     capture = cv2.VideoCapture(video_path)
-    fps = 30
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -147,21 +99,8 @@ if __name__ == '__main__':
         print('detect frame:%d' % (index))
         index += 1
 
-
-        # 预处理方式一
-        pimage = process_image(np.copy(frame), input_shape)
-        # 预处理方式二
-        # pimage = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # pimage = np.expand_dims(pimage, axis=0)
-
-        outs = yolo.predict(pimage)
-        boxes, scores, classes = outs[0][0], outs[1][0], outs[2][0]
-
-        img_h, img_w, _ = frame.shape
-        a = input_shape[0]
-        boxes = boxes * [img_w/a, img_h/a, img_w/a, img_h/a]
-        if boxes is not None and draw_image:
-            draw(frame, boxes, scores, classes, all_classes, colors)
+        pimage, im_size = _decode.process_image(np.copy(frame))
+        image, boxes, scores, classes = _decode.detect_image(frame, pimage, im_size, draw_image, draw_thresh)
 
         cv2.imshow("detection", frame)
         writer.write(frame)

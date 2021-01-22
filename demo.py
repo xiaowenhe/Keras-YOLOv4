@@ -3,8 +3,8 @@
 # ================================================================
 #
 #   Author      : miemie2013
-#   Created date: 2020-05-20 15:35:27
-#   Description : keras_yolov4
+#   Created date: 2020-10-30 21:08:11
+#   Description : keras_ppyolo
 #
 # ================================================================
 from collections import deque
@@ -12,76 +12,117 @@ import datetime
 import cv2
 import os
 import time
-import numpy as np
-import tensorflow as tf
-import keras.layers as layers
-from tools.cocotools import get_classes
-from model.yolov4 import YOLOv4
+import threading
+import argparse
+
+from config import *
 from model.decode_np import Decode
+from model.yolo import *
+from tools.cocotools import get_classes
 
 import logging
 FORMAT = '%(asctime)s-%(levelname)s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 logger = logging.getLogger(__name__)
 
+parser = argparse.ArgumentParser(description='YOLO Infer Script')
+parser.add_argument('--use_gpu', type=bool, default=True)
+parser.add_argument('--config', type=int, default=1,
+                    choices=[0, 1, 2],
+                    help='0 -- yolov4_2x.py;  1 -- ppyolo_2x.py;  2 -- ppyolo_r18vd.py;  ')
+args = parser.parse_args()
+config_file = args.config
+use_gpu = args.use_gpu
 
 
-# 6G的卡，训练时如果要预测，则设置use_gpu = False，否则显存不足。
-use_gpu = False
-use_gpu = True
+def read_test_data(path_dir,
+                   _decode,
+                   test_dic):
+    for k, filename in enumerate(path_dir):
+        key_list = list(test_dic.keys())
+        key_len = len(key_list)
+        while key_len >= 3:
+            time.sleep(0.01)
+            key_list = list(test_dic.keys())
+            key_len = len(key_list)
 
-# 显存分配。
-if use_gpu:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-else:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-from keras.backend.tensorflow_backend import set_session
-config = tf.ConfigProto()
-config.gpu_options.per_process_gpu_memory_fraction = 1.0
-set_session(tf.Session(config=config))
+        image = cv2.imread('images/test/' + filename)
+        pimage, im_size = _decode.process_image(np.copy(image))
+        dic = {}
+        dic['image'] = image
+        dic['pimage'] = pimage
+        dic['im_size'] = im_size
+        test_dic['%.8d' % k] = dic
 
+def save_img(filename, image):
+    cv2.imwrite('images/res/' + filename, image)
 
 if __name__ == '__main__':
-    # classes_path = 'data/voc_classes.txt'
-    classes_path = 'data/coco_classes.txt'
-    # model_path可以是'yolov4.h5'、'./weights/step00001000.h5'这些。
-    model_path = 'yolov4.h5'
-    # model_path = './weights/step00070000.h5'
-
-    # input_shape越大，精度会上升，但速度会下降。
-    # input_shape = (320, 320)
-    input_shape = (416, 416)
-    # input_shape = (608, 608)
-
-    # 验证时的分数阈值和nms_iou阈值
-    conf_thresh = 0.05
-    nms_thresh = 0.45
-
-    # 是否给图片画框。不画可以提速。读图片、后处理还可以继续优化。
-    draw_image = True
-    # draw_image = False
+    cfg = None
+    if config_file == 0:
+        cfg = YOLOv4_2x_Config()
+    elif config_file == 1:
+        cfg = PPYOLO_2x_Config()
+    elif config_file == 2:
+        cfg = PPYOLO_r18vd_Config()
 
 
-    num_anchors = 3
-    all_classes = get_classes(classes_path)
+    # 读取的模型
+    model_path = cfg.test_cfg['model_path']
+
+    # 是否给图片画框。
+    draw_image = cfg.test_cfg['draw_image']
+    draw_thresh = cfg.test_cfg['draw_thresh']
+
+    all_classes = get_classes(cfg.classes_path)
     num_classes = len(all_classes)
-    inputs = layers.Input(shape=(None, None, 3))
-    yolo = YOLOv4(inputs, num_classes, num_anchors)
-    yolo.load_weights(model_path, by_name=True)
 
-    _decode = Decode(conf_thresh, nms_thresh, input_shape, yolo, all_classes)
+
+    # 创建模型
+    Backbone = select_backbone(cfg.backbone_type)
+    backbone = Backbone(**cfg.backbone)
+    Head = select_head(cfg.head_type)
+    cfg.head['drop_block'] = False   # 预测时关闭DropBlock，以获得一致的推理结果。
+    head = Head(yolo_loss=None, nms_cfg=cfg.nms_cfg, **cfg.head)
+    yolo = YOLO(backbone, head)
+
+    x = keras.layers.Input(shape=(None, None, 3), name='x', dtype='float32')
+    im_size = keras.layers.Input(shape=(2,), name='im_size', dtype='int32')
+    outputs = yolo.get_outputs(x)
+    preds = yolo.get_prediction(outputs, im_size)
+    predict_model = keras.models.Model(inputs=[x, im_size], outputs=preds)
+    predict_model.load_weights(model_path, by_name=True, skip_mismatch=True)
+    predict_model.summary(line_length=130)
+
+    _decode = Decode(predict_model, all_classes, use_gpu, cfg, for_test=True)
 
     if not os.path.exists('images/res/'): os.mkdir('images/res/')
-
-
     path_dir = os.listdir('images/test')
+
+    # 读数据的线程
+    test_dic = {}
+    thr = threading.Thread(target=read_test_data,
+                           args=(path_dir,
+                                 _decode,
+                                 test_dic))
+    thr.start()
+
+    key_list = list(test_dic.keys())
+    key_len = len(key_list)
+    while key_len == 0:
+        time.sleep(0.01)
+        key_list = list(test_dic.keys())
+        key_len = len(key_list)
+    dic = test_dic['%.8d' % 0]
+    image = dic['image']
+    pimage = dic['pimage']
+    im_size = dic['im_size']
+
+
     # warm up
     if use_gpu:
-        for k, filename in enumerate(path_dir):
-            image = cv2.imread('images/test/' + filename)
-            image, boxes, scores, classes = _decode.detect_image(image, draw_image=False)
-            if k == 10:
-                break
+        for k in range(20):
+            image, boxes, scores, classes = _decode.detect_image(image, pimage, im_size, draw_image=False)
 
 
     time_stat = deque(maxlen=20)
@@ -90,8 +131,18 @@ if __name__ == '__main__':
     num_imgs = len(path_dir)
     start = time.time()
     for k, filename in enumerate(path_dir):
-        image = cv2.imread('images/test/' + filename)
-        image, boxes, scores, classes = _decode.detect_image(image, draw_image)
+        key_list = list(test_dic.keys())
+        key_len = len(key_list)
+        while key_len == 0:
+            time.sleep(0.01)
+            key_list = list(test_dic.keys())
+            key_len = len(key_list)
+        dic = test_dic.pop('%.8d' % k)
+        image = dic['image']
+        pimage = dic['pimage']
+        im_size = dic['im_size']
+
+        image, boxes, scores, classes = _decode.detect_image(image, pimage, im_size, draw_image, draw_thresh)
 
         # 估计剩余时间
         start_time = end_time
@@ -103,7 +154,8 @@ if __name__ == '__main__':
 
         logger.info('Infer iter {}, num_imgs={}, eta={}.'.format(k, num_imgs, eta))
         if draw_image:
-            cv2.imwrite('images/res/' + filename, image)
+            t2 = threading.Thread(target=save_img, args=(filename, image))
+            t2.start()
             logger.info("Detection bbox results save in images/res/{}".format(filename))
     cost = time.time() - start
     logger.info('total time: {0:.6f}s'.format(cost))

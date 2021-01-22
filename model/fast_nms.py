@@ -3,17 +3,11 @@
 # ================================================================
 #
 #   Author      : miemie2013
-#   Created date: 2020-06-03 15:35:27
-#   Description : keras_yolov4
+#   Created date: 2020-10-30 21:08:11
+#   Description : keras_ppyolo
 #
 # ================================================================
-
-import keras
 import tensorflow as tf
-import keras.layers as layers
-from keras import backend as K
-from keras.engine.topology import Layer
-
 
 
 def _iou(box_a, box_b):
@@ -22,20 +16,15 @@ def _iou(box_a, box_b):
     :param box_b:    [c, B, 4]
     :return:   [c, A, B]  两两之间的iou
     '''
-    # 变成左上角坐标、右下角坐标
-    boxes1 = tf.concat([box_a[..., :2] - box_a[..., 2:] * 0.5,
-                        box_a[..., :2] + box_a[..., 2:] * 0.5], axis=-1)
-    boxes2 = tf.concat([box_b[..., :2] - box_b[..., 2:] * 0.5,
-                        box_b[..., :2] + box_b[..., 2:] * 0.5], axis=-1)
 
-    c = tf.shape(boxes1)[0]
-    A = tf.shape(boxes1)[1]
-    B = tf.shape(boxes2)[1]
+    c = tf.shape(box_a)[0]
+    A = tf.shape(box_a)[1]
+    B = tf.shape(box_b)[1]
 
-    box_a = tf.reshape(boxes1, (c, A, 1, 4))
-    box_b = tf.reshape(boxes2, (c, 1, B, 4))
-    expand_box_a = tf.tile(box_a, [1, 1, B, 1])
-    expand_box_b = tf.tile(box_b, [1, A, 1, 1])
+    _box_a = tf.reshape(box_a, (c, A, 1, 4))
+    _box_b = tf.reshape(box_b, (c, 1, B, 4))
+    expand_box_a = tf.tile(_box_a, [1, 1, B, 1])
+    expand_box_b = tf.tile(_box_b, [1, A, 1, 1])
 
     # 两个矩形的面积
     boxes1_area = (expand_box_a[..., 2] - expand_box_a[..., 0]) * (
@@ -54,7 +43,7 @@ def _iou(box_a, box_b):
     iou = inter_area / (union_area + 1e-9)
     return iou
 
-def fast_nms(boxes, scores, conf_thresh, nms_thresh, keep_top_k, nms_top_k):
+def _fast_nms(boxes, scores, nms_thresh, keep_top_k, nms_top_k):
     '''
     :param boxes:    [?, 4]
     :param scores:   [80, ?]
@@ -115,42 +104,82 @@ def fast_nms(boxes, scores, conf_thresh, nms_thresh, keep_top_k, nms_top_k):
 
     return boxes, scores, classes
 
-def fastnms(all_pred_boxes, all_pred_scores, conf_thresh, nms_thresh, keep_top_k, nms_top_k):
+
+def fast_nms(bboxes,
+             scores,
+             score_threshold,
+             nms_threshold,
+             nms_top_k,
+             keep_top_k):
     '''
-    :param all_pred_boxes:      [batch_size, -1, 4]
-    :param all_pred_scores:     [batch_size, -1, 80]
+    :param bboxes:  [-1, 4]
+    :param scores:  [-1, 80]
     '''
-    conf_preds = tf.transpose(all_pred_scores, perm=[0, 2, 1])  # [1, 80, -1]
-    cur_scores = conf_preds[0]  # [80, -1]
+    cur_scores = tf.transpose(scores, perm=[1, 0])  # [80, -1]
     conf_scores = tf.reduce_max(cur_scores, axis=0)  # [-1, ]  每个预测框的所有类别的最高分数
-    keep = tf.where(conf_scores > conf_thresh)  # 最高分数大与阈值的保留
+    keep = tf.where(conf_scores > score_threshold)  # 最高分数大与阈值的保留
     keep = tf.reshape(keep, (-1,))  # [-1, ]
 
-    scores = tf.gather(all_pred_scores[0], keep)  # [?, 80]
-    scores = tf.transpose(scores, perm=[1, 0])  # [80, ?]
-    boxes = tf.gather(all_pred_boxes[0], keep)  # [?, 4]
-    boxes, scores, classes = fast_nms(boxes, scores, conf_thresh, nms_thresh, keep_top_k, nms_top_k)
+    # I hate tensorflow.
+    def exist_objs_1(keep, scores, bboxes):
+        scores = tf.gather(scores, keep)  # [?, 80]
+        scores = tf.transpose(scores, perm=[1, 0])  # [80, ?]
+        boxes = tf.gather(bboxes, keep)  # [?, 4]
+        boxes, scores, classes = _fast_nms(boxes, scores, nms_threshold, keep_top_k, nms_top_k)
 
+        # 再做一次分数过滤。前面提到，只要某个框最高分数>阈值就保留，
+        # 然而计算上面那个矩阵时，这个框其实重复了80次，每一个分身代表是不同类的物品。
+        # 非最高分数的其它类别，它的得分可能小于阈值，要过滤。
+        # 所以fastnms存在这么一个现象：某个框它最高分数 > 阈值，它有一个非最高分数类的得分也超过了阈值，
+        # 那么最后有可能两个框都保留，而且这两个框有相同的xywh
+        keep = tf.where(scores > score_threshold)  # 最高分数大与阈值的保留
+        keep = tf.reshape(keep, (-1,))  # [-1, ]
 
-    # 再做一次分数过滤。前面提到，只要某个框最高分数>阈值就保留，
-    # 然而计算上面那个矩阵时，这个框其实重复了80次，每一个分身代表是不同类的物品。
-    # 非最高分数的其它类别，它的得分可能小于阈值，要过滤。
-    # 所以fastnms存在这么一个现象：某个框它最高分数 > 阈值，它有一个非最高分数类的得分也超过了阈值，
-    # 那么最后有可能两个框都保留，而且这两个框有相同的xywh
-    keep = tf.where(scores > conf_thresh)  # 最高分数大与阈值的保留
-    keep = tf.reshape(keep, (-1,))  # [-1, ]
-    boxes = tf.gather(boxes, keep)
-    scores = tf.gather(scores, keep)
-    classes = tf.gather(classes, keep)
+        # I hate tensorflow.
+        def exist_objs_2(keep, boxes, scores, classes):
+            boxes = tf.gather(boxes, keep)
+            scores = tf.gather(scores, keep)
+            classes = tf.gather(classes, keep)
 
+            # sort and keep keep_top_k
+            k = tf.shape(scores)[0]
+            _, sort_inds = tf.nn.top_k(scores, k=k, sorted=True)
+            sort_inds = sort_inds[:keep_top_k]
+            boxes = tf.gather(boxes, sort_inds)
+            scores = tf.gather(scores, sort_inds)
+            classes = tf.gather(classes, sort_inds)
 
-    # 变成左上角坐标、右下角坐标
-    boxes = tf.concat([boxes[..., :2] - boxes[..., 2:] * 0.5,
-                       boxes[..., :2] + boxes[..., 2:] * 0.5], axis=-1)
+            scores = tf.reshape(scores, (-1, 1))
+            classes = tf.reshape(classes, (-1, 1))
+            classes = tf.cast(classes, tf.float32)
+            pred = tf.concat([classes, scores, boxes], 1)
 
-    # 为了应付keras自定义层的规则
-    boxes = tf.reshape(boxes, (1, -1, 4))
-    scores = tf.reshape(scores, (1, -1))
-    classes = tf.reshape(classes, (1, -1))
-    return [boxes, scores, classes]
+            obj_num = tf.shape(pred)[0]
+            pad_pred = tf.zeros((keep_top_k-obj_num, 6), tf.float32) - 1.0
+            pred = tf.concat([pred, pad_pred], 0)
+            return pred
+
+        # I hate tensorflow.
+        def no_objs_2():
+            pred = tf.zeros((keep_top_k, 6), tf.float32) - 1.0
+            return pred
+
+        # 是否有物体
+        # I hate tensorflow.
+        pred = tf.cond(tf.equal(tf.shape(keep)[0], 0),
+                       no_objs_2,
+                       lambda: exist_objs_2(keep, boxes, scores, classes))
+        return pred
+
+    # I hate tensorflow.
+    def no_objs_1():
+        pred = tf.zeros((keep_top_k, 6), tf.float32) - 1.0
+        return pred
+
+    # 是否有物体
+    # I hate tensorflow.
+    pred = tf.cond(tf.equal(tf.shape(keep)[0], 0),
+                   no_objs_1,
+                   lambda: exist_objs_1(keep, scores, bboxes))
+    return pred
 

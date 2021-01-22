@@ -3,28 +3,22 @@
 # ================================================================
 #
 #   Author      : miemie2013
-#   Created date: 2020-05-20 15:35:27
-#   Description : keras_yolov4
+#   Created date: 2020-10-30 21:08:11
+#   Description : keras_ppyolo
 #
 # ================================================================
-import cv2
 from collections import deque
-import math
-import json
 import time
 import threading
 import datetime
-import keras
-import random
-import copy
-import numpy as np
-import keras.layers as layers
+from collections import OrderedDict
 import os
-import tensorflow as tf
-from keras import backend as K
+import argparse
 
-from config import TrainConfig
-from model.yolov4 import YOLOv4
+from config import *
+from model.EMA import ExponentialMovingAverage
+
+from model.yolo import YOLO
 from tools.cocotools import get_classes, catid2clsid, clsid2catid
 from model.decode_np import Decode
 from tools.cocotools import eval
@@ -37,6 +31,15 @@ FORMAT = '%(asctime)s-%(levelname)s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 logger = logging.getLogger(__name__)
 
+parser = argparse.ArgumentParser(description='YOLO Training Script')
+parser.add_argument('--use_gpu', type=bool, default=True)
+parser.add_argument('--config', type=int, default=1,
+                    choices=[0, 1, 2],
+                    help='0 -- yolov4_2x.py;  1 -- ppyolo_2x.py;  2 -- ppyolo_r18vd.py;  ')
+args = parser.parse_args()
+config_file = args.config
+use_gpu = args.use_gpu
+
 
 # 显存分配
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -45,261 +48,178 @@ config = tf.ConfigProto()
 config.gpu_options.per_process_gpu_memory_fraction = 1.0
 set_session(tf.Session(config=config))
 
-def bbox_ciou(boxes1, boxes2):
-    '''
-    计算ciou = iou - p2/c2 - av
-    :param boxes1: (8, 13, 13, 3, 4)   pred_xywh
-    :param boxes2: (8, 13, 13, 3, 4)   label_xywh
-    :return:
-
-    举例时假设pred_xywh和label_xywh的shape都是(1, 4)
-    '''
-
-    # 变成左上角坐标、右下角坐标
-    boxes1_x0y0x1y1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                                 boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
-    boxes2_x0y0x1y1 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                                 boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
-    '''
-    逐个位置比较boxes1_x0y0x1y1[..., :2]和boxes1_x0y0x1y1[..., 2:]，即逐个位置比较[x0, y0]和[x1, y1]，小的留下。
-    比如留下了[x0, y0]
-    这一步是为了避免一开始w h 是负数，导致x0y0成了右下角坐标，x1y1成了左上角坐标。
-    '''
-    boxes1_x0y0x1y1 = tf.concat([tf.minimum(boxes1_x0y0x1y1[..., :2], boxes1_x0y0x1y1[..., 2:]),
-                                 tf.maximum(boxes1_x0y0x1y1[..., :2], boxes1_x0y0x1y1[..., 2:])], axis=-1)
-    boxes2_x0y0x1y1 = tf.concat([tf.minimum(boxes2_x0y0x1y1[..., :2], boxes2_x0y0x1y1[..., 2:]),
-                                 tf.maximum(boxes2_x0y0x1y1[..., :2], boxes2_x0y0x1y1[..., 2:])], axis=-1)
-
-    # 两个矩形的面积
-    boxes1_area = (boxes1_x0y0x1y1[..., 2] - boxes1_x0y0x1y1[..., 0]) * (
-                boxes1_x0y0x1y1[..., 3] - boxes1_x0y0x1y1[..., 1])
-    boxes2_area = (boxes2_x0y0x1y1[..., 2] - boxes2_x0y0x1y1[..., 0]) * (
-                boxes2_x0y0x1y1[..., 3] - boxes2_x0y0x1y1[..., 1])
-
-    # 相交矩形的左上角坐标、右下角坐标，shape 都是 (8, 13, 13, 3, 2)
-    left_up = tf.maximum(boxes1_x0y0x1y1[..., :2], boxes2_x0y0x1y1[..., :2])
-    right_down = tf.minimum(boxes1_x0y0x1y1[..., 2:], boxes2_x0y0x1y1[..., 2:])
-
-    # 相交矩形的面积inter_area。iou
-    inter_section = tf.maximum(right_down - left_up, 0.0)
-    inter_area = inter_section[..., 0] * inter_section[..., 1]
-    union_area = boxes1_area + boxes2_area - inter_area
-    iou = inter_area / (union_area + 1e-9)
-
-    # 包围矩形的左上角坐标、右下角坐标，shape 都是 (8, 13, 13, 3, 2)
-    enclose_left_up = tf.minimum(boxes1_x0y0x1y1[..., :2], boxes2_x0y0x1y1[..., :2])
-    enclose_right_down = tf.maximum(boxes1_x0y0x1y1[..., 2:], boxes2_x0y0x1y1[..., 2:])
-
-    # 包围矩形的对角线的平方
-    enclose_wh = enclose_right_down - enclose_left_up
-    enclose_c2 = K.pow(enclose_wh[..., 0], 2) + K.pow(enclose_wh[..., 1], 2)
-
-    # 两矩形中心点距离的平方
-    p2 = K.pow(boxes1[..., 0] - boxes2[..., 0], 2) + K.pow(boxes1[..., 1] - boxes2[..., 1], 2)
-
-    # 增加av。加上除0保护防止nan。
-    atan1 = tf.atan(boxes1[..., 2] / (boxes1[..., 3] + 1e-9))
-    atan2 = tf.atan(boxes2[..., 2] / (boxes2[..., 3] + 1e-9))
-    v = 4.0 * K.pow(atan1 - atan2, 2) / (math.pi ** 2)
-    a = v / (1 - iou + v)
-
-    ciou = iou - 1.0 * p2 / enclose_c2 - 1.0 * a * v
-    return ciou
 
 
-def bbox_iou(boxes1, boxes2):
-    '''
-    预测框          boxes1 (?, grid_h, grid_w, 3,   1, 4)，神经网络的输出(tx, ty, tw, th)经过了后处理求得的(bx, by, bw, bh)
-    图片中所有的gt  boxes2 (?,      1,      1, 1, 70, 4)
-    '''
-    boxes1_area = boxes1[..., 2] * boxes1[..., 3]  # 所有格子的3个预测框的面积
-    boxes2_area = boxes2[..., 2] * boxes2[..., 3]  # 所有ground truth的面积
+def multi_thread_op(i, num_threads, batch_size, samples, context, with_mixup, sample_transforms, batch_transforms,
+                    shape, images, gt_bbox, gt_score, gt_class, target0, target1, target2, target_num):
+    for k in range(i, batch_size, num_threads):
+        for sample_transform in sample_transforms:
+            if isinstance(sample_transform, MixupImage):
+                if with_mixup:
+                    samples[k] = sample_transform(samples[k], context)
+            else:
+                samples[k] = sample_transform(samples[k], context)
 
-    # (x, y, w, h)变成(x0, y0, x1, y1)
-    boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                        boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
-    boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                        boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
+        for batch_transform in batch_transforms:
+            if isinstance(batch_transform, RandomShapeSingle):
+                samples[k] = batch_transform(shape, samples[k], context)
+            else:
+                samples[k] = batch_transform(samples[k], context)
 
-    # 所有格子的3个预测框 分别 和  70个ground truth  计算iou。 所以left_up和right_down的shape = (?, grid_h, grid_w, 3, 70, 2)
-    left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])  # 相交矩形的左上角坐标
-    right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])  # 相交矩形的右下角坐标
-
-    inter_section = tf.maximum(right_down - left_up, 0.0)  # 相交矩形的w和h，是负数时取0     (?, grid_h, grid_w, 3, 70, 2)
-    inter_area = inter_section[..., 0] * inter_section[..., 1]  # 相交矩形的面积            (?, grid_h, grid_w, 3, 70)
-    union_area = boxes1_area + boxes2_area - inter_area  # union_area      (?, grid_h, grid_w, 3, 70)
-    iou = 1.0 * inter_area / union_area  # iou                             (?, grid_h, grid_w, 3, 70)
-    return iou
-
-def loss_layer(conv, pred, label, bboxes, stride, num_class, iou_loss_thresh):
-    conv_shape = tf.shape(conv)
-    batch_size = conv_shape[0]
-    output_size = conv_shape[1]
-    input_size = stride * output_size
-    conv = tf.reshape(conv, (batch_size, output_size, output_size,
-                             3, 5 + num_class))
-    conv_raw_prob = conv[:, :, :, :, 5:]
-
-    pred_xywh = pred[:, :, :, :, 0:4]
-    pred_conf = pred[:, :, :, :, 4:5]
-
-    label_xywh = label[:, :, :, :, 0:4]
-    respond_bbox = label[:, :, :, :, 4:5]
-    label_prob = label[:, :, :, :, 5:]
-
-    ciou = tf.expand_dims(bbox_ciou(pred_xywh, label_xywh), axis=-1)  # (8, 13, 13, 3, 1)
-    input_size = tf.cast(input_size, tf.float32)
-
-    # 每个预测框xxxiou_loss的权重 = 2 - (ground truth的面积/图片面积)
-    bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (input_size ** 2)
-    ciou_loss = respond_bbox * bbox_loss_scale * (1 - ciou)  # 1. respond_bbox作为mask，有物体才计算xxxiou_loss
-
-    # 2. respond_bbox作为mask，有物体才计算类别loss
-    prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_prob, logits=conv_raw_prob)
-    # 等价于
-    # pred_prob = pred[:, :, :, :, 5:]
-    # prob_pos_loss = label_prob * (0 - K.log(pred_prob + 1e-9))
-    # prob_neg_loss = (1 - label_prob) * (0 - K.log(1 - pred_prob + 1e-9))
-    # prob_mask = tf.tile(respond_bbox, [1, 1, 1, 1, num_class])
-    # prob_loss = prob_mask * (prob_pos_loss + prob_neg_loss)
+        # 整理成ndarray
+        images[k] = np.expand_dims(samples[k]['image'].astype(np.float32), 0)
+        gt_bbox[k] = np.expand_dims(samples[k]['gt_bbox'].astype(np.float32), 0)
+        gt_score[k] = np.expand_dims(samples[k]['gt_score'].astype(np.float32), 0)
+        gt_class[k] = np.expand_dims(samples[k]['gt_class'].astype(np.int32), 0)
+        target0[k] = np.expand_dims(samples[k]['target0'].astype(np.float32), 0)
+        target1[k] = np.expand_dims(samples[k]['target1'].astype(np.float32), 0)
+        if target_num > 2:
+            target2[k] = np.expand_dims(samples[k]['target2'].astype(np.float32), 0)
 
 
-    # 3. xxxiou_loss和类别loss比较简单。重要的是conf_loss，是一个二值交叉熵损失
-    # 分两步：第一步是确定 grid_h * grid_w * 3 个预测框 哪些作为反例；第二步是计算二值交叉熵损失。
-    expand_pred_xywh = pred_xywh[:, :, :, :, np.newaxis, :]  # 扩展为(?, grid_h, grid_w, 3,   1, 4)
-    expand_bboxes = bboxes[:, np.newaxis, np.newaxis, np.newaxis, :, :]  # 扩展为(?,      1,      1, 1, 70, 4)
-    iou = bbox_iou(expand_pred_xywh, expand_bboxes)  # 所有格子的3个预测框 分别 和  70个ground truth  计算iou。   (?, grid_h, grid_w, 3, 70)
-    max_iou = tf.expand_dims(tf.reduce_max(iou, axis=-1), axis=-1)  # 与70个ground truth的iou中，保留最大那个iou。  (?, grid_h, grid_w, 3, 1)
+def read_train_data(cfg,
+                    train_indexes,
+                    train_steps,
+                    train_records,
+                    batch_size,
+                    _iter_id,
+                    train_dic,
+                    use_gpu,
+                    context, with_mixup, sample_transforms, batch_transforms, target_num):
+    iter_id = _iter_id
+    num_threads = cfg.train_cfg['num_threads']
+    while True:   # 无限个epoch
+        # 每个epoch之前洗乱
+        np.random.shuffle(train_indexes)
+        for step in range(train_steps):
+            iter_id += 1
 
-    # respond_bgd代表  这个分支输出的 grid_h * grid_w * 3 个预测框是否是 反例（背景）
-    # label有物体，respond_bgd是0。 没物体的话：如果和某个gt(共70个)的iou超过iou_loss_thresh，respond_bgd是0；如果和所有gt(最多70个)的iou都小于iou_loss_thresh，respond_bgd是1。
-    # respond_bgd是0代表有物体，不是反例（或者是忽略框）；  权重respond_bgd是1代表没有物体，是反例。
-    # 有趣的是，模型训练时由于不断更新，对于同一张图片，两次预测的 grid_h * grid_w * 3 个预测框（对于这个分支输出）  是不同的。用的是这些预测框来与gt计算iou来确定哪些预测框是反例。
-    # 而不是用固定大小（不固定位置）的先验框。
-    respond_bgd = (1.0 - respond_bbox) * tf.cast(max_iou < iou_loss_thresh, tf.float32)
+            key_list = list(train_dic.keys())
+            key_len = len(key_list)
+            while key_len >= cfg.train_cfg['max_batch']:
+                time.sleep(0.01)
+                key_list = list(train_dic.keys())
+                key_len = len(key_list)
 
-    # 二值交叉熵损失
-    pos_loss = respond_bbox * (0 - K.log(pred_conf + 1e-9))
-    neg_loss = respond_bgd  * (0 - K.log(1 - pred_conf + 1e-9))
+            # ==================== train ====================
+            sizes = cfg.randomShape['sizes']
+            shape = np.random.choice(sizes)
+            images = [None] * batch_size
+            gt_bbox = [None] * batch_size
+            gt_score = [None] * batch_size
+            gt_class = [None] * batch_size
+            target0 = [None] * batch_size
+            target1 = [None] * batch_size
+            target2 = [None] * batch_size
 
-    conf_loss = pos_loss + neg_loss
-    # 回顾respond_bgd，某个预测框和某个gt的iou超过iou_loss_thresh，不被当作是反例。在参与“预测的置信位 和 真实置信位 的 二值交叉熵”时，这个框也可能不是正例(label里没标这个框是1的话)。这个框有可能不参与置信度loss的计算。
-    # 这种框一般是gt框附近的框，或者是gt框所在格子的另外两个框。它既不是正例也不是反例不参与置信度loss的计算。（论文里称之为ignore）
+            samples = get_samples(train_records, train_indexes, step, batch_size, with_mixup)
+            # sample_transforms用多线程
+            threads = []
+            for i in range(num_threads):
+                t = threading.Thread(target=multi_thread_op, args=(i, num_threads, batch_size, samples, context, with_mixup, sample_transforms, batch_transforms,
+                                                                   shape, images, gt_bbox, gt_score, gt_class, target0, target1, target2, target_num))
+                threads.append(t)
+                t.start()
+            # 等待所有线程任务结束。
+            for t in threads:
+                t.join()
 
-    ciou_loss = tf.reduce_mean(tf.reduce_sum(ciou_loss, axis=[1, 2, 3, 4]))  # 每个样本单独计算自己的ciou_loss，再求平均值
-    conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1, 2, 3, 4]))  # 每个样本单独计算自己的conf_loss，再求平均值
-    prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1, 2, 3, 4]))  # 每个样本单独计算自己的prob_loss，再求平均值
+            images = np.concatenate(images, 0)
+            gt_bbox = np.concatenate(gt_bbox, 0)
+            target0 = np.concatenate(target0, 0)
+            target1 = np.concatenate(target1, 0)
+            if target_num > 2:
+                target2 = np.concatenate(target2, 0)
 
-    return ciou_loss, conf_loss, prob_loss
+            dic = {}
+            dic['images'] = images.transpose(0, 2, 3, 1)
+            dic['gt_bbox'] = gt_bbox
+            dic['target0'] = target0
+            dic['target1'] = target1
+            if target_num > 2:
+                dic['target2'] = target2
+            train_dic['%.8d'%iter_id] = dic
 
-def decode(conv_output, anchors, stride, num_class):
-    conv_shape       = tf.shape(conv_output)
-    batch_size       = conv_shape[0]
-    output_size      = conv_shape[1]
-    anchor_per_scale = len(anchors)
-    conv_output = tf.reshape(conv_output, (batch_size, output_size, output_size, anchor_per_scale, 5 + num_class))
-    conv_raw_dxdy = conv_output[:, :, :, :, 0:2]
-    conv_raw_dwdh = conv_output[:, :, :, :, 2:4]
-    conv_raw_conf = conv_output[:, :, :, :, 4:5]
-    conv_raw_prob = conv_output[:, :, :, :, 5: ]
-    y = tf.tile(tf.range(output_size, dtype=tf.int32)[:, tf.newaxis], [1, output_size])
-    x = tf.tile(tf.range(output_size, dtype=tf.int32)[tf.newaxis, :], [output_size, 1])
-    xy_grid = tf.concat([x[:, :, tf.newaxis], y[:, :, tf.newaxis]], axis=-1)
-    xy_grid = tf.tile(xy_grid[tf.newaxis, :, :, tf.newaxis, :], [batch_size, 1, 1, anchor_per_scale, 1])
-    xy_grid = tf.cast(xy_grid, tf.float32)
-    pred_xy = (tf.sigmoid(conv_raw_dxdy) + xy_grid) * stride
-    pred_wh = (tf.exp(conv_raw_dwdh) * anchors)
-    pred_xywh = tf.concat([pred_xy, pred_wh], axis=-1)
-    pred_conf = tf.sigmoid(conv_raw_conf)
-    pred_prob = tf.sigmoid(conv_raw_prob)
-    return tf.concat([pred_xywh, pred_conf, pred_prob], axis=-1)
-
-def yolo_loss(args, num_classes, iou_loss_thresh, anchors):
-    conv_lbbox = args[0]   # (?, ?, ?, 3*(num_classes+5))
-    conv_mbbox = args[1]   # (?, ?, ?, 3*(num_classes+5))
-    conv_sbbox = args[2]   # (?, ?, ?, 3*(num_classes+5))
-    label_sbbox = args[3]   # (?, ?, ?, 3, num_classes+5)
-    label_mbbox = args[4]   # (?, ?, ?, 3, num_classes+5)
-    label_lbbox = args[5]   # (?, ?, ?, 3, num_classes+5)
-    true_bboxes = args[6]   # (?, 50, 4)
-    pred_sbbox = decode(conv_sbbox, anchors[0], 8, num_classes)
-    pred_mbbox = decode(conv_mbbox, anchors[1], 16, num_classes)
-    pred_lbbox = decode(conv_lbbox, anchors[2], 32, num_classes)
-    sbbox_ciou_loss, sbbox_conf_loss, sbbox_prob_loss = loss_layer(conv_sbbox, pred_sbbox, label_sbbox, true_bboxes, 8, num_classes, iou_loss_thresh)
-    mbbox_ciou_loss, mbbox_conf_loss, mbbox_prob_loss = loss_layer(conv_mbbox, pred_mbbox, label_mbbox, true_bboxes, 16, num_classes, iou_loss_thresh)
-    lbbox_ciou_loss, lbbox_conf_loss, lbbox_prob_loss = loss_layer(conv_lbbox, pred_lbbox, label_lbbox, true_bboxes, 32, num_classes, iou_loss_thresh)
-
-    ciou_loss = sbbox_ciou_loss + mbbox_ciou_loss + lbbox_ciou_loss
-    conf_loss = sbbox_conf_loss + mbbox_conf_loss + lbbox_conf_loss
-    prob_loss = sbbox_prob_loss + mbbox_prob_loss + lbbox_prob_loss
-    return [ciou_loss, conf_loss, prob_loss]
+            # ==================== exit ====================
+            if iter_id == cfg.train_cfg['max_iters']:
+                return 0
 
 
-def multi_thread_op(i, samples, decodeImage, context, train_dataset, with_mixup, mixupImage,
-                     photometricDistort, randomCrop, randomFlipImage, normalizeBox, padBox, bboxXYXY2XYWH):
-    samples[i] = decodeImage(samples[i], context, train_dataset)
-    if with_mixup:
-        samples[i] = mixupImage(samples[i], context)
-    samples[i] = photometricDistort(samples[i], context)
-    samples[i] = randomCrop(samples[i], context)
-    samples[i] = randomFlipImage(samples[i], context)
-    samples[i] = normalizeBox(samples[i], context)
-    samples[i] = padBox(samples[i], context)
-    samples[i] = bboxXYXY2XYWH(samples[i], context)
+
 
 if __name__ == '__main__':
-    cfg = TrainConfig()
+    cfg = None
+    if config_file == 0:
+        cfg = YOLOv4_2x_Config()
+    elif config_file == 1:
+        cfg = PPYOLO_2x_Config()
+    elif config_file == 2:
+        cfg = PPYOLO_r18vd_Config()
 
     class_names = get_classes(cfg.classes_path)
     num_classes = len(class_names)
-    _anchors = copy.deepcopy(cfg.anchors)
-    num_anchors = len(cfg.anchor_masks[0])  # 每个输出层有几个先验框
-    _anchors = np.array(_anchors)
-    _anchors = np.reshape(_anchors, (-1, num_anchors, 2))
-    _anchors = _anchors.astype(np.float32)
 
     # 步id，无需设置，会自动读。
     iter_id = 0
 
-    # 多尺度训练
-    inputs = layers.Input(shape=(None, None, 3))
-    model_body = YOLOv4(inputs, num_classes, num_anchors)
-    _decode = Decode(cfg.conf_thresh, cfg.nms_thresh, cfg.input_shape, model_body, class_names)
+    # 创建模型
+    target_num = len(cfg.head['anchor_masks'])
+    Backbone = select_backbone(cfg.backbone_type)
+    backbone = Backbone(**cfg.backbone)
+    IouLoss = select_loss(cfg.iou_loss_type)
+    iou_loss = IouLoss(**cfg.iou_loss)
+    iou_aware_loss = None
+    if cfg.head['iou_aware']:
+        IouAwareLoss = select_loss(cfg.iou_aware_loss_type)
+        iou_aware_loss = IouAwareLoss(**cfg.iou_aware_loss)
+    Loss = select_loss(cfg.yolo_loss_type)
+    yolo_loss = Loss(iou_loss=iou_loss, iou_aware_loss=iou_aware_loss, **cfg.yolo_loss)
+    Head = select_head(cfg.head_type)
+    head = Head(yolo_loss=yolo_loss, is_train=True, nms_cfg=cfg.nms_cfg, **cfg.head)   # 评测时还是会使用了DropBlock，所以用eval.py评测模型时与训练时评测得到的mAP有一点不同。
+    yolo = YOLO(backbone, head)
 
-    # 模式。 0-从头训练，1-读取之前的模型继续训练（model_path可以是'yolov4.h5'、'./weights/step00001000.h5'这些。）
-    pattern = cfg.pattern
-    if pattern == 1:
-        model_body.load_weights(cfg.model_path, by_name=True, skip_mismatch=True)
-        strs = cfg.model_path.split('step')
+    # predict_model
+    x = keras.layers.Input(shape=(None, None, 3), name='x', dtype='float32')
+    im_size = keras.layers.Input(shape=(2,), name='im_size', dtype='int32')
+    outputs = yolo.get_outputs(x)
+    preds = yolo.get_prediction(outputs, im_size)
+    predict_model = keras.models.Model(inputs=[x, im_size], outputs=preds)
+
+    # train_model
+    anchor_masks = cfg.gt2YoloTarget['anchor_masks']
+    anchor_num_per_layer = len(anchor_masks[0])
+    num_filters = (num_classes + 6)
+    gt_bbox_tensor = keras.layers.Input(shape=(None, 4), name='gt_bbox', dtype='float32')
+    target0_tensor = keras.layers.Input(shape=(anchor_num_per_layer, num_filters, None, None), name='target0', dtype='float32')
+    target1_tensor = keras.layers.Input(shape=(anchor_num_per_layer, num_filters, None, None), name='target1', dtype='float32')
+    if target_num > 2:
+        target2_tensor = keras.layers.Input(shape=(anchor_num_per_layer, num_filters, None, None), name='target2', dtype='float32')
+        targets = [target0_tensor, target1_tensor, target2_tensor]
+    else:
+        targets = [target0_tensor, target1_tensor]
+    loss_list = keras.layers.Lambda(yolo.get_loss, name='yolo_loss',
+                                    arguments={'target_num': target_num, })([*outputs, gt_bbox_tensor, *targets])
+    train_model = keras.models.Model(inputs=[x, gt_bbox_tensor, *targets], outputs=loss_list)
+    loss_n = len(loss_list)
+
+    _decode = Decode(predict_model, class_names, use_gpu, cfg, for_test=False)
+
+    # 加载权重
+    if cfg.train_cfg['model_path'] is not None:
+        # 加载参数, 跳过形状不匹配的。
+        train_model.load_weights(cfg.train_cfg['model_path'], by_name=True, skip_mismatch=True)
+
+        strs = cfg.train_cfg['model_path'].split('step')
         if len(strs) == 2:
             iter_id = int(strs[1][:8])
 
-        # 冻结，使得需要的显存减少。6G的卡建议这样配置。11G的卡建议不冻结。
-        # freeze_before = 'conv2d_60'
-        # freeze_before = 'conv2d_72'
-        freeze_before = 'conv2d_86'
-        for i in range(len(model_body.layers)):
-            ly = model_body.layers[i]
-            if ly.name == freeze_before:
-                break
-            else:
-                ly.trainable = False
-    elif pattern == 0:
-        pass
+        # 冻结，使得需要的显存减少。低显存的卡建议这样配置。
+        backbone.freeze()
 
-    y_true = [
-        layers.Input(name='input_2', shape=(None, None, 3, (num_classes + 5))),  # label_sbbox
-        layers.Input(name='input_3', shape=(None, None, 3, (num_classes + 5))),  # label_mbbox
-        layers.Input(name='input_4', shape=(None, None, 3, (num_classes + 5))),  # label_lbbox
-        layers.Input(name='input_5', shape=(cfg.num_max_boxes, 4)),             # true_bboxes
-    ]
-    loss_list = layers.Lambda(yolo_loss, name='yolo_loss',
-                           arguments={'num_classes': num_classes, 'iou_loss_thresh': cfg.iou_loss_thresh,
-                                      'anchors': _anchors})([*model_body.output, *y_true])
-    model = keras.models.Model([model_body.input, *y_true], loss_list)
-    model.summary()
-    # keras.utils.vis_utils.plot_model(model_body, to_file='yolov4.png', show_shapes=True)
-
+    ema = None
+    if cfg.use_ema:
+        ema = ExponentialMovingAverage(predict_model, cfg.ema_decay)
+        ema.register()
 
     # 种类id
     _catid2clsid = copy.deepcopy(catid2clsid)
@@ -317,37 +237,58 @@ if __name__ == '__main__':
     num_train = len(train_records)
     train_indexes = [i for i in range(num_train)]
     # 验证集
-    with open(cfg.val_path, 'r', encoding='utf-8') as f2:
-        for line in f2:
-            line = line.strip()
-            dataset = json.loads(line)
-            val_images = dataset['images']
+    val_dataset = COCO(cfg.val_path)
+    val_img_ids = val_dataset.getImgIds()
+    val_images = []   # 只跑有gt的图片，跟随PaddleDetection
+    for img_id in val_img_ids:
+        ins_anno_ids = val_dataset.getAnnIds(imgIds=img_id, iscrowd=False)   # 读取这张图片所有标注anno的id
+        if len(ins_anno_ids) == 0:
+            continue
+        img_anno = val_dataset.loadImgs(img_id)[0]
+        val_images.append(img_anno)
 
-    batch_size = cfg.batch_size
-    with_mixup = cfg.with_mixup
+    batch_size = cfg.train_cfg['batch_size']
+    with_mixup = cfg.decodeImage['with_mixup']
     context = cfg.context
     # 预处理
     # sample_transforms
-    decodeImage = DecodeImage(with_mixup=with_mixup)   # 对图片解码。最开始的一步。
-    mixupImage = MixupImage()                   # mixup增强
-    photometricDistort = PhotometricDistort()   # 颜色扭曲
-    randomCrop = RandomCrop()                   # 随机裁剪
-    randomFlipImage = RandomFlipImage()         # 随机翻转
-    normalizeBox = NormalizeBox()               # 将物体的左上角坐标、右下角坐标中的横坐标/图片宽、纵坐标/图片高 以归一化坐标。
-    padBox = PadBox(cfg.num_max_boxes)          # 如果gt_bboxes的数量少于num_max_boxes，那么填充坐标是0的bboxes以凑够num_max_boxes。
-    bboxXYXY2XYWH = BboxXYXY2XYWH()             # sample['gt_bbox']被改写为cx_cy_w_h格式。
-    # batch_transforms
-    randomShape = RandomShape()                 # 多尺度训练。随机选一个尺度。也随机选一种插值方式。
-    normalizeImage = NormalizeImage(is_scale=True, is_channel_first=False)  # 图片归一化。直接除以255。
-    gt2YoloTarget = Gt2YoloTarget(cfg.anchors,
-                                  cfg.anchor_masks,
-                                  cfg.downsample_ratios,
-                                  num_classes)             # 填写target0、target1、target2张量。
+    decodeImage = DecodeImage(**cfg.decodeImage)   # 对图片解码。最开始的一步。
+    mixupImage = MixupImage(**cfg.mixupImage)      # mixup增强
+    colorDistort = ColorDistort(**cfg.colorDistort)  # 颜色扰动
+    randomExpand = RandomExpand(**cfg.randomExpand)  # 随机填充
+    randomCrop = RandomCrop(**cfg.randomCrop)        # 随机裁剪
+    randomFlipImage = RandomFlipImage(**cfg.randomFlipImage)  # 随机翻转
+    normalizeBox = NormalizeBox(**cfg.normalizeBox)        # 将物体的左上角坐标、右下角坐标中的横坐标/图片宽、纵坐标/图片高 以归一化坐标。
+    padBox = PadBox(**cfg.padBox)                          # 如果gt_bboxes的数量少于num_max_boxes，那么填充坐标是0的bboxes以凑够num_max_boxes。
+    bboxXYXY2XYWH = BboxXYXY2XYWH(**cfg.bboxXYXY2XYWH)     # sample['gt_bbox']被改写为cx_cy_w_h格式。
+    # batch_transforms改sample_transforms
+    randomShape = RandomShapeSingle(random_inter=cfg.randomShape['random_inter'])     # 多尺度训练。随机选一个尺度。也随机选一种插值方式。
+    normalizeImage = NormalizeImage(**cfg.normalizeImage)     # 图片归一化。先除以255归一化，再减均值除以标准差
+    permute = Permute(**cfg.permute)    # 图片从HWC格式变成CHW格式
+    gt2YoloTarget = Gt2YoloTargetSingle(**cfg.gt2YoloTarget)   # 填写target张量。
+
+    sample_transforms = []
+    sample_transforms.append(decodeImage)
+    sample_transforms.append(mixupImage)
+    sample_transforms.append(colorDistort)
+    sample_transforms.append(randomExpand)
+    sample_transforms.append(randomCrop)
+    sample_transforms.append(randomFlipImage)
+    sample_transforms.append(normalizeBox)
+    sample_transforms.append(padBox)
+    sample_transforms.append(bboxXYXY2XYWH)
+
+    batch_transforms = []
+    batch_transforms.append(randomShape)
+    batch_transforms.append(normalizeImage)
+    batch_transforms.append(permute)
+    batch_transforms.append(gt2YoloTarget)
 
     # 保存模型的目录
     if not os.path.exists('./weights'): os.mkdir('./weights')
 
-    model.compile(loss={'yolo_loss': lambda y_true, y_pred: y_pred}, optimizer=keras.optimizers.Adam(lr=cfg.lr))
+    train_model.compile(loss={'yolo_loss': lambda y_true, y_pred: y_pred}, optimizer=keras.optimizers.Adam(lr=cfg.train_cfg['lr']))
+    train_model.summary(line_length=130)
 
     time_stat = deque(maxlen=20)
     start_time = time.time()
@@ -355,53 +296,118 @@ if __name__ == '__main__':
 
     # 一轮的步数。丢弃最后几个样本。
     train_steps = num_train // batch_size
+
+    # 读数据的线程
+    train_dic ={}
+    thr = threading.Thread(target=read_train_data,
+                           args=(cfg,
+                                 train_indexes,
+                                 train_steps,
+                                 train_records,
+                                 batch_size,
+                                 iter_id,
+                                 train_dic,
+                                 use_gpu,
+                                 context, with_mixup, sample_transforms, batch_transforms, target_num))
+    thr.start()
+
+
     best_ap_list = [0.0, 0]  #[map, iter]
+    train_speed_count = 0
+    train_speed_start = 0.0
     while True:   # 无限个epoch
         # 每个epoch之前洗乱
         np.random.shuffle(train_indexes)
         for step in range(train_steps):
             iter_id += 1
 
+            key_list = list(train_dic.keys())
+            key_len = len(key_list)
+            while key_len == 0:
+                time.sleep(0.01)
+                key_list = list(train_dic.keys())
+                key_len = len(key_list)
+            dic = train_dic.pop('%.8d'%iter_id)
+
             # 估计剩余时间
             start_time = end_time
             end_time = time.time()
             time_stat.append(end_time - start_time)
             time_cost = np.mean(time_stat)
-            eta_sec = (cfg.max_iters - iter_id) * time_cost
+            eta_sec = (cfg.train_cfg['max_iters'] - iter_id) * time_cost
             eta = str(datetime.timedelta(seconds=int(eta_sec)))
 
             # ==================== train ====================
-            samples = get_samples(train_records, train_indexes, step, batch_size, with_mixup)
-            # sample_transforms用多线程
-            threads = []
-            for i in range(batch_size):
-                t = threading.Thread(target=multi_thread_op, args=(i, samples, decodeImage, context, train_dataset, with_mixup, mixupImage,
-                                                                   photometricDistort, randomCrop, randomFlipImage, normalizeBox, padBox, bboxXYXY2XYWH))
-                threads.append(t)
-                t.start()
-            # 等待所有线程任务结束。
-            for t in threads:
-                t.join()
+            images = dic['images']
+            gt_bbox = dic['gt_bbox']
+            target0 = dic['target0']
+            target1 = dic['target1']
+            if target_num > 2:
+                target2 = dic['target2']
+                targets = [target0, target1, target2]
+            else:
+                targets = [target0, target1]
+            batch_xs = [images, gt_bbox, *targets]
+            y_true = [np.zeros(batch_size) for _ in range(loss_n)]
+            losses = train_model.train_on_batch(batch_xs, y_true)
 
-            # batch_transforms
-            samples = randomShape(samples, context)
-            samples = normalizeImage(samples, context)
-            batch_image, batch_label, batch_gt_bbox = gt2YoloTarget(samples, context)
+            _all_loss = losses[0]
+            _loss_xy = losses[1]
+            _loss_wh = losses[2]
+            _loss_obj = losses[3]
+            _loss_cls = losses[4]
+            _loss_iou = -10.0
+            _loss_iou_aware = -10.0
+            if yolo_loss._iou_loss is not None:
+                _loss_iou = losses[5]
+            if yolo_loss._iou_aware_loss is not None:
+                _loss_iou_aware = losses[6]
 
-            batch_xs = [batch_image, batch_label[2], batch_label[1], batch_label[0], batch_gt_bbox]
-            y_true = [np.zeros(batch_size), np.zeros(batch_size), np.zeros(batch_size)]
-            losses = model.train_on_batch(batch_xs, y_true)
+            if cfg.use_ema:
+                ema.update()   # 更新ema字典
 
             # ==================== log ====================
             if iter_id % 20 == 0:
-                strs = 'Train iter: {}, all_loss: {:.6f}, ciou_loss: {:.6f}, conf_loss: {:.6f}, prob_loss: {:.6f}, eta: {}'.format(
-                    iter_id, losses[0], losses[1], losses[2], losses[3], eta)
+                strs = ''
+                if _loss_iou > 0.0 and _loss_iou_aware > 0.0:
+                    strs = 'Train iter: {}, all_loss: {:.6f}, loss_xy: {:.6f}, loss_wh: {:.6f}, loss_obj: {:.6f}, loss_cls: {:.6f}, loss_iou: {:.6f}, loss_iou_aware: {:.6f}, eta: {}'.format(
+                        iter_id, _all_loss, _loss_xy, _loss_wh, _loss_obj, _loss_cls, _loss_iou, _loss_iou_aware, eta)
+                elif _loss_iou <= 0.0 and _loss_iou_aware > 0.0:
+                    strs = 'Train iter: {}, all_loss: {:.6f}, loss_xy: {:.6f}, loss_wh: {:.6f}, loss_obj: {:.6f}, loss_cls: {:.6f}, loss_iou_aware: {:.6f}, eta: {}'.format(
+                        iter_id, _all_loss, _loss_xy, _loss_wh, _loss_obj, _loss_cls, _loss_iou_aware, eta)
+                elif _loss_iou > 0.0 and _loss_iou_aware <= 0.0:
+                    strs = 'Train iter: {}, all_loss: {:.6f}, loss_xy: {:.6f}, loss_wh: {:.6f}, loss_obj: {:.6f}, loss_cls: {:.6f}, loss_iou: {:.6f}, eta: {}'.format(
+                        iter_id, _all_loss, _loss_xy, _loss_wh, _loss_obj, _loss_cls, _loss_iou, eta)
+                elif _loss_iou <= 0.0 and _loss_iou_aware <= 0.0:
+                    strs = 'Train iter: {}, all_loss: {:.6f}, loss_xy: {:.6f}, loss_wh: {:.6f}, loss_obj: {:.6f}, loss_cls: {:.6f}, eta: {}'.format(
+                        iter_id, _all_loss, _loss_xy, _loss_wh, _loss_obj, _loss_cls, eta)
                 logger.info(strs)
 
+            # ==================== train_speed ====================
+            mod_iter_id = iter_id % 1000
+            step_iter = 200   # 每隔200步计算一下训练速度。
+            if mod_iter_id >= 20:   # 前20步热身。
+                if mod_iter_id == 20:
+                    train_speed_count = 0
+                    train_speed_start = time.time()
+                elif mod_iter_id > 825:
+                    pass
+                else:
+                    train_speed_count += 1
+                    if train_speed_count % step_iter == 0:
+                        sts = train_speed_count // step_iter
+                        sts *= step_iter
+                        cost = time.time() - train_speed_start
+                        logger.info('Train Speed: %.3f steps per second.' % ((sts / cost), ))
+
             # ==================== save ====================
-            if iter_id % cfg.save_iter == 0:
+            if iter_id % cfg.train_cfg['save_iter'] == 0:
+                if cfg.use_ema:
+                    ema.apply()
                 save_path = './weights/step%.8d.h5' % iter_id
-                model.save(save_path)
+                predict_model.save_weights(save_path)
+                if cfg.use_ema:
+                    ema.restore()
                 path_dir = os.listdir('./weights')
                 steps = []
                 names = []
@@ -416,21 +422,26 @@ if __name__ == '__main__':
                 logger.info('Save model to {}'.format(save_path))
 
             # ==================== eval ====================
-            if iter_id % cfg.eval_iter == 0:
-                box_ap = eval(_decode, val_images, cfg.val_pre_path, cfg.val_path, cfg.eval_batch_size, _clsid2catid, cfg.draw_image)
+            if iter_id % cfg.train_cfg['eval_iter'] == 0:
+                if cfg.use_ema:
+                    ema.apply()
+                head.set_dropblock(is_test=True)   # 没卵用，因为是静态图。为了和Pytorch版保持风格一致，故保留。
+                box_ap = eval(_decode, val_images, cfg.val_pre_path, cfg.val_path, cfg.eval_cfg['eval_batch_size'], _clsid2catid, cfg.eval_cfg['draw_image'], cfg.eval_cfg['draw_thresh'])
                 logger.info("box ap: %.3f" % (box_ap[0], ))
+                head.set_dropblock(is_test=False)  # 没卵用，因为是静态图。为了和Pytorch版保持风格一致，故保留。
 
                 # 以box_ap作为标准
                 ap = box_ap
                 if ap[0] > best_ap_list[0]:
                     best_ap_list[0] = ap[0]
                     best_ap_list[1] = iter_id
-                    model.save('./weights/best_model.h5')
-                logger.info("Best test ap: {}, in iter: {}".format(
-                    best_ap_list[0], best_ap_list[1]))
+                    predict_model.save_weights('./weights/best_model.h5')
+                if cfg.use_ema:
+                    ema.restore()
+                logger.info("Best test ap: {}, in iter: {}".format(best_ap_list[0], best_ap_list[1]))
 
             # ==================== exit ====================
-            if iter_id == cfg.max_iters:
+            if iter_id == cfg.train_cfg['max_iters']:
                 logger.info('Done.')
                 exit(0)
 

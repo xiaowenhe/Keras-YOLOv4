@@ -3,40 +3,51 @@
 # ================================================================
 #
 #   Author      : miemie2013
-#   Created date: 2020-05-20 15:35:27
-#   Description : keras_yolov4
+#   Created date: 2020-10-30 21:08:11
+#   Description : keras_ppyolo
 #
 # ================================================================
-import keras.layers as layers
-from tools.cocotools import get_classes
-from model.yolov4 import YOLOv4
+from config import *
+import argparse
+
+from tools.cocotools import *
 from model.decode_np import Decode
-import json
-from tools.cocotools import test_dev
+from model.yolo import *
+from tools.cocotools import get_classes
 
 import logging
 FORMAT = '%(asctime)s-%(levelname)s: %(message)s'
 logging.basicConfig(level=logging.INFO, format=FORMAT)
 logger = logging.getLogger(__name__)
 
+parser = argparse.ArgumentParser(description='YOLO Eval Script')
+parser.add_argument('--use_gpu', type=bool, default=True)
+parser.add_argument('--config', type=int, default=1,
+                    choices=[0, 1, 2],
+                    help='0 -- yolov4_2x.py;  1 -- ppyolo_2x.py;  2 -- ppyolo_r18vd.py;  ')
+args = parser.parse_args()
+config_file = args.config
+use_gpu = args.use_gpu
 
 if __name__ == '__main__':
-    classes_path = 'data/coco_classes.txt'
-    # model_path可以是'yolov4.h5'、'./weights/step00001000.h5'这些。
-    model_path = 'yolov4.h5'
-    # model_path = './weights/step00070000.h5'
+    cfg = None
+    if config_file == 0:
+        cfg = YOLOv4_2x_Config()
+    elif config_file == 1:
+        cfg = PPYOLO_2x_Config()
+    elif config_file == 2:
+        cfg = PPYOLO_r18vd_Config()
 
-    # input_shape越大，精度会上升，但速度会下降。
-    # input_shape = (320, 320)
-    # input_shape = (416, 416)
-    input_shape = (608, 608)
-    # 测试时的分数阈值和nms_iou阈值
-    conf_thresh = 0.001
-    nms_thresh = 0.45
-    # 是否画出test集图片
-    draw_image = False
-    # 测试时的批大小
-    test_batch_size = 4
+
+    # 读取的模型
+    model_path = cfg.eval_cfg['model_path']
+
+    # 是否给图片画框。
+    draw_image = cfg.eval_cfg['draw_image']
+    draw_thresh = cfg.eval_cfg['draw_thresh']
+
+    # 验证时的批大小
+    eval_batch_size = cfg.eval_cfg['eval_batch_size']
 
     # test集图片的相对路径
     test_pre_path = '../COCO/test2017/'
@@ -47,13 +58,32 @@ if __name__ == '__main__':
             dataset = json.loads(line)
             images = dataset['images']
 
-    num_anchors = 3
-    all_classes = get_classes(classes_path)
+    all_classes = get_classes(cfg.classes_path)
     num_classes = len(all_classes)
-    inputs = layers.Input(shape=(None, None, 3))
-    yolo = YOLOv4(inputs, num_classes, num_anchors)
-    yolo.load_weights(model_path, by_name=True)
 
-    _decode = Decode(conf_thresh, nms_thresh, input_shape, yolo, all_classes)
-    test_dev(_decode, images, test_pre_path, test_batch_size, draw_image)
+
+    # 创建模型
+    Backbone = select_backbone(cfg.backbone_type)
+    backbone = Backbone(**cfg.backbone)
+    Head = select_head(cfg.head_type)
+    cfg.head['drop_block'] = False   # 预测时关闭DropBlock，以获得一致的推理结果。
+    head = Head(yolo_loss=None, nms_cfg=cfg.nms_cfg, **cfg.head)
+    yolo = YOLO(backbone, head)
+
+    x = keras.layers.Input(shape=(None, None, 3), name='x', dtype='float32')
+    im_size = keras.layers.Input(shape=(2,), name='im_size', dtype='int32')
+    outputs = yolo.get_outputs(x)
+    preds = yolo.get_prediction(outputs, im_size)
+    predict_model = keras.models.Model(inputs=[x, im_size], outputs=preds)
+    predict_model.load_weights(model_path, by_name=True, skip_mismatch=True)
+    predict_model.summary(line_length=130)
+
+    _clsid2catid = copy.deepcopy(clsid2catid)
+    if num_classes != 80:   # 如果不是COCO数据集，而是自定义数据集
+        _clsid2catid = {}
+        for k in range(num_classes):
+            _clsid2catid[k] = k
+
+    _decode = Decode(predict_model, all_classes, use_gpu, cfg, for_test=False)
+    eval(_decode, images, test_pre_path, anno_file, eval_batch_size, _clsid2catid, draw_image, draw_thresh, type='test_dev')
 
